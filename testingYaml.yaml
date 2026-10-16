@@ -1,0 +1,92 @@
+
+      - name: Checkout PR commit history
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate all commit messages reference PR Jira
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          PR_JIRA_KEY: ${{ steps.extract.outputs.jira_key }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          expected = os.environ["PR_JIRA_KEY"].upper()
+          base = os.environ["PR_BASE_SHA"]
+          head = os.environ["PR_HEAD_SHA"]
+
+          if not expected:
+              print("::error::PR Jira key is missing")
+              sys.exit(1)
+
+          # Find all commits in the PR, including merge commits.
+          result = subprocess.check_output([
+              "git", "log", "-z",
+              "--format=%H%x00%B",
+              f"{base}..{head}"
+          ])
+
+          records = result.decode(
+              "utf-8", errors="replace"
+          ).split("\0")
+
+          if records[-1] == "":
+              records.pop()
+
+          if not records or len(records) % 2 != 0:
+              print("::error::Cannot read PR commit history")
+              sys.exit(1)
+
+          # Recognize Jira keys such as EDP-1234.
+          jira_pattern = re.compile(
+              r"(?<![A-Za-z0-9_])[A-Za-z][A-Za-z0-9_]*-[0-9]{1,10}(?![A-Za-z0-9_])"
+          )
+
+          errors = 0
+          total = len(records) // 2
+
+          print(f"Expected Jira: {expected}")
+          print(f"Checking {total} commits")
+
+          for i in range(0, len(records), 2):
+              sha = records[i]
+              message = records[i + 1]
+              subject = message.splitlines()[0] if message.strip() else ""
+
+              jira_keys = {
+                  key.upper()
+                  for key in jira_pattern.findall(message)
+              }
+
+              if jira_keys != {expected}:
+                  errors += 1
+                  found = ", ".join(sorted(jira_keys)) or "NONE"
+                  print(
+                      f"::error::Commit {sha[:12]}: "
+                      f"Expected {expected}, found {found}"
+                  )
+                  print(f"  Message: {subject}")
+              else:
+                  print(f"PASS {sha[:12]}: {subject}")
+
+          if errors:
+              print(
+                  f"::error::{errors}/{total} commits "
+                  "failed Jira validation"
+              )
+              sys.exit(1)
+
+          print(f"SUCCESS: All {total} commits reference {expected}")
+          PY
